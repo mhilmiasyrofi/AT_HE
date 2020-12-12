@@ -9,9 +9,13 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 
 from models.wideresnet import *
-from losses import alp_loss, pgd_loss, trades_loss
+from models.resnet import *
+
+
+from losses import alp_loss, pgd_loss, trades_loss, normalize
 
 parser = argparse.ArgumentParser(description='Adversarial Training')
+parser.add_argument('--attack', default='pgd')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
@@ -53,7 +57,7 @@ parser.add_argument('--s', default=15.0, type=float, help='s value')
 
 args = parser.parse_args()
 
-model_dir = "checkpoint//" + args.loss
+model_dir = "checkpoint/" + args.loss
 
 if not os.path.exists(model_dir):
     os.makedirs(model_dir)
@@ -61,6 +65,24 @@ use_cuda = not args.no_cuda and torch.cuda.is_available()
 torch.manual_seed(args.seed)
 device = torch.device("cuda" if use_cuda else "cpu")
 kwargs = {'num_workers': 8, 'pin_memory': True} if use_cuda else {}
+
+class Batches():
+    def __init__(self, dataset, batch_size, shuffle, set_random_choices=False, drop_last=False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.set_random_choices = set_random_choices
+        self.dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, **kwargs
+        )
+
+    def __iter__(self):
+        if self.set_random_choices:
+            self.dataset.set_random_choices()
+        return ({'input': x.to(device).float(), 'target': y.to(device).long()} for (x,y) in self.dataloader)
+
+    def __len__(self):
+        return len(self.dataloader)
+
 
 # setup data loader
 transform_train = transforms.Compose([
@@ -71,10 +93,41 @@ transform_train = transforms.Compose([
 transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
-trainset = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
-train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, **kwargs)
-testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
-test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+train_set = torchvision.datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
+test_set = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
+
+# train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, **kwargs)
+# test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+
+train_batches = Batches(train_set, args.batch_size, shuffle=True)
+test_batches = Batches(test_set, args.batch_size, shuffle=False)
+
+
+# load adversarial examples
+adv_dir = "adv_examples/{}/".format(args.attack)
+train_path = adv_dir + "train.pth" 
+test_path = adv_dir + "test.pth"
+
+adv_train_data = torch.load(train_path)
+train_adv_images = adv_train_data["adv"]
+train_adv_labels = adv_train_data["label"]
+
+adv_test_data = torch.load(test_path)
+test_adv_images = adv_test_data["adv"]
+test_adv_labels = adv_test_data["label"]
+
+train_adv_set = list(zip(train_adv_images,
+    train_adv_labels))
+
+train_adv_batches = Batches(train_adv_set, args.batch_size, shuffle=True)
+
+test_adv_set = list(zip(test_adv_images,
+    test_adv_labels))
+
+test_adv_batches = Batches(test_adv_set, args.batch_size, shuffle=True)
+
+
+
 LOSS= {
         'pgd': pgd_loss,
         'pgd_he': pgd_loss,
@@ -86,15 +139,21 @@ LOSS= {
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-
+    for batch_idx, (batch, adv_batch) in enumerate(zip(train_batches, train_adv_batches)):
+        data = batch["input"]
+        target = batch["target"]
+        
+        x_adv = adv_batch["input"]
+        y_adv = adv_batch["target"]
+        
         optimizer.zero_grad()
 
         # calculate robust loss
         loss = LOSS[args.loss](model=model,
                            x_natural=data,
+                           x_adv=x_adv
                            y=target,
+                           y_adv = y_adv,
                            optimizer=optimizer,
                            step_size=args.step_size,
                            epsilon=args.epsilon,
@@ -114,42 +173,20 @@ def train(args, model, device, train_loader, optimizer, epoch):
                        100. * batch_idx / len(train_loader), loss.item()))
 
 
-def eval_train(model, device, train_loader):
+def evaluate(model, device, data_loader):
     model.eval()
-    train_loss = 0
+    loss = 0
     correct = 0
     with torch.no_grad():
-        for data, target in train_loader:
+        for data, target in data_loader:
             data, target = data.to(device), target.to(device)
-            output = model(data)
+            output = model(normalize(data))
             train_loss += F.cross_entropy(output, target, size_average=False).item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
-    train_loss /= len(train_loader.dataset)
-    print('Training: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-        train_loss, correct, len(train_loader.dataset),
-        100. * correct / len(train_loader.dataset)))
-    training_accuracy = correct / len(train_loader.dataset)
-    return train_loss, training_accuracy
-
-
-def eval_test(model, device, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.cross_entropy(output, target, size_average=False).item()
-            pred = output.max(1, keepdim=True)[1]
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    test_loss /= len(test_loader.dataset)
-    print('Test: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-    test_accuracy = correct / len(test_loader.dataset)
-    return test_loss, test_accuracy
+    loss /= len(data_loader.dataset)
+    accuracy = correct / len(data_loader.dataset)
+    return loss, accuracy
 
 
 def adjust_learning_rate(optimizer, epoch):
@@ -167,12 +204,14 @@ def adjust_learning_rate(optimizer, epoch):
 
 def main():
     # init model, ResNet18() can be also used here for training
-    if args.loss == 'alp' or args.loss == 'trades' or args.loss == 'pgd':
-        print("normalize False")
-        model = nn.DataParallel(WideResNet()).to(device)
-    else:
-        print("normalize True")
-        model = nn.DataParallel(WideResNet(use_FNandWN = True)).to(device)
+#     if args.loss == 'alp' or args.loss == 'trades' or args.loss == 'pgd':
+#         print("normalize False")
+#         model = nn.DataParallel(WideResNet()).to(device)
+#     else:
+#         print("normalize True")
+#         model = nn.DataParallel(WideResNet(use_FNandWN = True)).to(device)
+
+    model = resnet18(pretrained=True)
     
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
@@ -185,14 +224,21 @@ def main():
 
         # evaluation on natural examples
         print('==============')
-        eval_train(model, device, train_loader)
-        eval_test(model, device, test_loader)
+        _, train_accuracy = evaluate(model, device, train_batches)
+        _, test_accuracy = evaluate(model, device, test_batches)
+        _, train_robust_accuracy = evaluate(model, device, train_adv_batches)
+        _, test_robust_accuracy = evaluate(model, device, test_adv_batches)
+
+        print("Train Accuracy: ", train_accuracy)
+        print("Test Accuracy: ", test_accuracy)
+        print("Train Robust Accuracy: ", train_robust_accuracy)
+        print("Test Robust Accuracy: ", test_robust_accuracy)
         print('==============')
 
         # save checkpoint
         if (epoch >= args.start_freq) and (epoch % args.save_freq == 0):
             torch.save(model.module.state_dict(),
-                       os.path.join(model_dir, 'wideres-epoch{}.pt'.format(epoch)))
+                       os.path.join(model_dir, 'res18-epoch{}.pt'.format(epoch)))
 
 if __name__ == '__main__':
     main()
